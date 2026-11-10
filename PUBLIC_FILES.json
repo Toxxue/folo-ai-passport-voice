@@ -74,6 +74,7 @@
     "windows/diagnose_voice.py",
     "windows/hotkey_forwarder.py",
     "windows/install.cmd",
+    "windows/interception_inject.py",
     "windows/requirements-hotkey.txt",
     "windows/start.cmd",
     "windows/tests/test_hotkey_forwarder_unit.py",

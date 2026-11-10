@@ -12,56 +12,76 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 import hotkey_forwarder as h  # noqa: E402
 
 
+class RecordingBackend:
+    """Key backend that records calls instead of touching a real injection API.
+
+    Keeps the dispatch tests free of side effects: without this stub the
+    forwarder would initialise the Interception driver (when installed) or
+    call SendInput, so a unit test could reach the real desktop.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def key_down(self, keys):
+        self.calls.append(("down", tuple(keys)))
+
+    def key_up(self, keys):
+        self.calls.append(("up", tuple(keys)))
+
+    def key_click(self, keys, hold_seconds=0.06):
+        self.calls.append(("down", tuple(keys)))
+        self.calls.append(("up", tuple(keys)))
+
+    def close(self):
+        pass
+
+
 class ForwarderDispatchTest(unittest.TestCase):
-    def setUp(self):
+    def _forwarder(self, key="right-shift", mode="tap"):
         args = argparse.Namespace(
-            key="right-shift",
-            mode="tap",
+            key=key,
+            mode=mode,
             no_audio=True,
             output_substr="CABLE Input",
+            key_backend="sendinput",
         )
-        self.forwarder = h.Forwarder(args)
+        backend = RecordingBackend()
+        with mock.patch.object(h, "create_key_backend", return_value=backend):
+            forwarder = h.Forwarder(args)
+        forwarder.test_backend = backend
+        return forwarder
+
+    def setUp(self):
+        self.forwarder = self._forwarder()
 
     @staticmethod
     def event(name, **fields):
         return (json.dumps({"event": name, **fields}) + "\n").encode("utf-8")
 
     def test_up_ptt_hold_mode_holds_key_and_releases_on_end(self):
-        args = argparse.Namespace(
-            key="right-shift",
-            mode="hold",
-            no_audio=True,
-            output_substr="CABLE Input",
-        )
-        fwd = h.Forwarder(args)
-        sent = []
-        with mock.patch.object(h, "_send_key", side_effect=lambda *a, **kw: sent.append((a, kw))), \
-             mock.patch.object(h.time, "sleep"):
+        fwd = self._forwarder(mode="hold")
+        with mock.patch.object(h.time, "sleep"):
             fwd.on_event(self.event("voice.start"))
             fwd.on_event(self.event("voice.end"))
 
-        self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[0][0][:3], h.KEY_MAP["right-shift"])
-        self.assertFalse(sent[0][1]["up"])   # Key down
-        self.assertEqual(sent[1][0][:3], h.KEY_MAP["right-shift"])
-        self.assertTrue(sent[1][1]["up"])    # Key up
+        calls = fwd.test_backend.calls
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "down")
+        self.assertEqual(calls[0][1][0][1:], h.KEY_MAP["right-shift"])
+        self.assertEqual(calls[1][0], "up")
+        self.assertEqual(calls[1][1][0][1:], h.KEY_MAP["right-shift"])
 
     def test_up_ptt_clicks_right_shift_at_start_and_again_at_release(self):
-        sent = []
-        with mock.patch.object(h, "_send_key", side_effect=lambda *a, **kw: sent.append((a, kw))), \
-             mock.patch.object(h.time, "sleep"):
+        with mock.patch.object(h.time, "sleep"):
             self.forwarder.on_event(self.event("voice.start"))
             self.forwarder.on_event(self.event("voice.end"))
 
-        self.assertEqual(len(sent), 4)
-        self.assertEqual(sent[0][0][:3], h.KEY_MAP["right-shift"])
-        self.assertFalse(sent[0][1]["up"])
-        self.assertEqual(sent[1][0][:3], h.KEY_MAP["right-shift"])
-        self.assertTrue(sent[1][1]["up"])
-        self.assertEqual(sent[2][0][:3], h.KEY_MAP["right-shift"])
-        self.assertFalse(sent[2][1]["up"])
-        self.assertEqual(sent[3][0][:3], h.KEY_MAP["right-shift"])
-        self.assertTrue(sent[3][1]["up"])
+        calls = self.forwarder.test_backend.calls
+        # Two clicks: down+up when the microphone opens, down+up when it closes.
+        self.assertEqual([c[0] for c in calls], ["down", "up", "down", "up"])
+        for call in calls:
+            self.assertEqual(call[1][0][1:], h.KEY_MAP["right-shift"])
 
     def test_down_enter_releases_stale_voice_then_injects_once(self):
         order = []
@@ -142,11 +162,9 @@ class ForwarderDispatchTest(unittest.TestCase):
         self.forwarder.on_audio(b"\x01\x80payload")
 
     def test_disconnect_without_active_session_does_not_inject_shift(self):
-        sent = []
-        with mock.patch.object(h, "_send_key", side_effect=lambda *a, **kw: sent.append((a, kw))), \
-             mock.patch.object(h.time, "sleep"):
+        with mock.patch.object(h.time, "sleep"):
             self.forwarder.on_disconnect()
-        self.assertEqual(sent, [])
+        self.assertEqual(self.forwarder.test_backend.calls, [])
 
 
 if __name__ == "__main__":

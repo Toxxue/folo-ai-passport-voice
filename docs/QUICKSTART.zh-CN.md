@@ -318,6 +318,7 @@ USB 用于供电/烧录，插着 USB 并不会自动出现 USB 麦克风；无�
 | output_substr | 接收设备音频的播放端名称匹配 | **CABLE Input**；不要填 CABLE Output |
 | udp_port | 电脑监听端口 | **33333**；不要随意改，设备也要对应 |
 | device_ip | 设备在路由器里的实际 IP，可选 | **空字符串**；广播发现正常时无需填写 |
+| key_backend | 按键注入后端：auto / interception / sendinput | **auto**；仅当输入法忽略模拟按键、快捷键不生效时才需要安装 Interception |
 
 device_ip 仅在同一局域网允许单播、但广播发现受阻时有用，不能绕过路由器客户端隔离。
 **下键固定发送 Enter，不受上述 hotkey_key 影响。** 当前没有 down_key 等配置项，也不能通过 JSON 交换设备上下键。
