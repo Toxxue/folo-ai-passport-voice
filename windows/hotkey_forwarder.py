@@ -45,6 +45,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adpcm
 from udp_transport import UdpTransport, UdpError, EVENT_UUID, AUDIO_UUID
 
+# 驱动级注入后端（Interception）。缺失时不影响 SendInput 回退路径。
+try:
+    import interception_inject
+except Exception:        # pragma: no cover - 仅在模块缺失时触发
+    interception_inject = None
+
 # ---------------------------------------------------------------------------
 # Windows 按键注入(ctypes SendInput, 零第三方依赖)
 # ---------------------------------------------------------------------------
@@ -203,6 +209,41 @@ def _send_key(vk, scan, extended, up):
     _get_worker().post(_do_send_key, vk, scan, extended, up)
 
 
+class SendInputBackend:
+    """用户态 SendInput 后端（保留为回退路径）。"""
+
+    def key_down(self, keys):
+        for _name, vk, scan, ext in keys:
+            _send_key(vk, scan, ext, up=False)
+
+    def key_up(self, keys):
+        for _name, vk, scan, ext in reversed(keys):
+            _send_key(vk, scan, ext, up=True)
+
+    def key_click(self, keys, hold_seconds=0.06):
+        self.key_down(keys)
+        time.sleep(hold_seconds)
+        self.key_up(keys)
+
+    def close(self):
+        pass
+
+
+def create_key_backend(choice):
+    """按配置选择注入后端：auto/interception 优先驱动级，失败回退 SendInput。"""
+    choice = str(choice or "auto").lower()
+    if choice in ("auto", "interception") and interception_inject is not None:
+        backend = interception_inject.try_create()
+        if backend is not None:
+            print("[key] 注入后端: Interception（驱动级，事件无 INJECTED 标记）")
+            return backend
+        if choice == "interception":
+            print("[key] Interception 不可用（驱动未装/未重启？），回退 SendInput",
+                  file=sys.stderr)
+    print("[key] 注入后端: SendInput（用户态）")
+    return SendInputBackend()
+
+
 class KeyInjector:
     """热键注入器(支持单键及组合键,如 right-shift / win+h / ctrl+shift+space)。
 
@@ -210,9 +251,10 @@ class KeyInjector:
     tap=开启时点击热键(Down+60ms+Up),松开时再次点击以结束录音提交上屏(适配点击式语音键)。
     """
 
-    def __init__(self, spec, mode):
+    def __init__(self, spec, mode, backend):
         self.spec = spec
         self.mode = mode
+        self.backend = backend
         self._keys = resolve_key_spec(spec)   # [(键名, vk, scan, ext), ...]
         self._held = False
         self._active = False
@@ -222,46 +264,32 @@ class KeyInjector:
         if self.mode == "hold":
             if not self._held:
                 self._held = True
-                for _name, vk, scan, ext in self._keys:
-                    _send_key(vk, scan, ext, up=False)
+                self.backend.key_down(self._keys)
                 print(f"[key] {self.spec} 按下(hold, 开启语音输入)")
         else:
             if self._active:
                 return
             self._active = True
-            for _name, vk, scan, ext in self._keys:
-                _send_key(vk, scan, ext, up=False)
-            time.sleep(0.06)
-            for _name, vk, scan, ext in reversed(self._keys):
-                _send_key(vk, scan, ext, up=True)
+            self.backend.key_click(self._keys)
             print(f"[key] {self.spec} 点击(tap, 开启语音输入)")
 
     def click(self):
         """发送单次按键点击(Down + 60ms + Up)，用于触发独立按键动作(如回车发送)。"""
         attach_to_default_desktop()
-        for _name, vk, scan, ext in self._keys:
-            _send_key(vk, scan, ext, up=False)
-        time.sleep(0.06)
-        for _name, vk, scan, ext in reversed(self._keys):
-            _send_key(vk, scan, ext, up=True)
+        self.backend.key_click(self._keys)
         print(f"[key] {self.spec} 点击(执行发送/确认)")
 
     def stop(self):
         attach_to_default_desktop()
         if self.mode == "hold" and self._held:
             self._held = False
-            for _name, vk, scan, ext in reversed(self._keys):
-                _send_key(vk, scan, ext, up=True)
+            self.backend.key_up(self._keys)
             print(f"[key] {self.spec} 抬起(hold, 结束语音输入)")
         elif self.mode == "tap" and self._active:
             # 满足输入法"按下可开启语音输入，按任意键均可结束"：松开按键时再发一次点击以提交上屏
             self._active = False
             time.sleep(0.08)
-            for _name, vk, scan, ext in self._keys:
-                _send_key(vk, scan, ext, up=False)
-            time.sleep(0.06)
-            for _name, vk, scan, ext in reversed(self._keys):
-                _send_key(vk, scan, ext, up=True)
+            self.backend.key_click(self._keys)
             print(f"[key] {self.spec} 再次点击(tap, 结束语音输入)")
 
 
@@ -408,8 +436,9 @@ class AudioSink:
 class Forwarder:
     def __init__(self, args):
         self.args = args
-        self.injector = KeyInjector(args.key, args.mode)
-        self.enter_injector = KeyInjector("enter", "tap")
+        self.backend = create_key_backend(getattr(args, "key_backend", "auto"))
+        self.injector = KeyInjector(args.key, args.mode, self.backend)
+        self.enter_injector = KeyInjector("enter", "tap", self.backend)
         self.sink = None if args.no_audio else AudioSink(args.output_substr)
         self.audio_blocks = 0
         self.active = False
@@ -642,6 +671,11 @@ def main():
                     default=str(cfg.get("device_ip") or ""),
                     help="设备目标IP(如 192.168.5.6,防路由器AP隔离阻断广播)")
     ap.add_argument("--no-audio", action="store_true", help="只做热键转发")
+    ap.add_argument("--key-backend",
+                    default=str(cfg.get("key_backend") or "auto"),
+                    choices=["auto", "interception", "sendinput"],
+                    help="按键注入后端: auto=优先 Interception 驱动级并回退; "
+                         "interception=仅驱动级; sendinput=仅用户态")
     ap.add_argument("--list-keys", action="store_true",
                     help="列出全部可用键名后退出")
     ap.add_argument("--list-devices", action="store_true",
